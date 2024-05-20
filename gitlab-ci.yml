@@ -1,0 +1,541 @@
+image: docker:latest
+
+variables:
+  GIT_SSL_NO_VERIFY: "true"
+  REGION: us-east-1
+  JIRA_SSM_HIERARCHY: /deployment/jira
+  JIRA_ISSUE_PREFIX: CT-
+  PROD_TAG_PREFIX: prod
+  GITLAB_TAG_COMPARE_URL: https://git.lindseyneidig.net/demo
+
+stages:
+  #tests
+  - unit-tests
+  - integration-tests
+  - cypress-ui-tests
+  #prod deployment stages
+  - deployment-summary
+  - database-update-prod
+  - build-publish-containers-prod
+  - force-update-containers-prod
+  - app-infra-deploy-prod
+  - create-jira-release
+  #nonprod deployment stages
+  - database-kill-fill-nonprod
+  - database-update-nonprod
+  - build-publish-containers-nonprod
+  - force-update-containers-nonprod
+  - app-infra-deploy-nonprod
+  - datalake-infra-deploy-nonprod
+  #other
+  - configure-uat
+  - configure-nonprod
+  - configure-demo
+  - configure-prod
+  - automated-tests
+  - security-scanning
+  - tear-down-env
+  - tear-down-stack
+
+#Prep runner for deployment tasks
+#set scripts to be executable, login to ecr, obtain gitlab commit info
+default:
+  before_script:
+    - echo $PWD
+    - source $PWD/deploy_scripts/development_tools.sh
+    - echo ${CI_COMMIT_REF_SLUG}
+    - TICKET_NUMBER=$(current_ticket_number "${CI_COMMIT_REF_SLUG}")
+    - TAG=$(tag_to_build "${CI_COMMIT_REF_SLUG}")
+    - echo ${TAG}
+    - ENVIRONMENT=$(get_environment_group_from_tag "$TAG")
+    - echo ${ENVIRONMENT}
+    - BRANCH_TAG=${CI_COMMIT_REF_SLUG}
+
+.unit_test_template: &unit_test_job
+  stage: unit-tests
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  only:
+    - branches
+  when: always
+
+.cypress_test_template: &cypress_test_job
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  only:
+    - tags
+  except:
+    - /^prod-[0-9]+-[0-9]{8}$/
+    - /^beta-[0-9]+-[0-9]{8}$/
+    - /^demo-[0-9]+-[0-9]{8}$/
+
+.integration_test_template: &integration_test_job
+  stage: automated-tests
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  only:
+    - branches
+  when: always
+
+.nonprod_job_template: &nonprod_job
+  stage: configure-nonprod
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  only:
+    - tags
+  except:
+    - /^prod-[0-9]+-[0-9]{8}$/
+    - /^beta-[0-9]+-[0-9]{8}$/
+    - /^demo-[0-9]+-[0-9]{8}$/
+  when: manual
+
+.prod_job_template: &prod_job
+  stage: configure-prod
+  tags:
+    - riskybusiness-prod-runner
+  only:
+    - /^prod-[0-9]+-[0-9]{8}$/
+    - /^beta-[0-9]+-[0-9]{8}$/
+  when: manual
+
+.demo_job_template: &demo_job
+  stage: configure-demo
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  only:
+    - /^demo-[0-9]+-[0-9]{8}$/
+  when: manual
+
+# FOR USE WHEN risky's db moves to new hub rds
+.update_database: &update_database
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    # CT Hub Migrations
+    - ./deploy_scripts/deploy/deploy_database.sh ${TAG} hub_${TAG} "hub/api"
+
+.kill_fill_database_old: &kill_fill_database_old
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_database.sh ${TAG} ${TAG} "api" kill
+
+.update_database_old: &update_database_old
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_database.sh ${TAG} ${TAG} "api"
+
+.create_jira_release: &create_jira_release
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_jira_integration.sh ${JIRA_ISSUE_PREFIX} ${PROD_TAG_PREFIX} ${BRANCH_TAG} ${REGION} ${JIRA_SSM_HIERARCHY}
+
+.deployment_summary: &deployment_summary
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_summary.sh ${JIRA_ISSUE_PREFIX} ${PROD_TAG_PREFIX} ${GITLAB_TAG_COMPARE_URL}
+
+.deploy_infrastructure: &deploy_infrastructure
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_application_infrastructure.sh ${ENVIRONMENT} ${TAG}
+
+.deploy_data_lake_infrastructure: &deploy_data_lake_infrastructure
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_datalake_infrastructure.sh cleartrac ${TAG}
+
+.deploy_athena_views: &deploy_athena_views
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_athena_views.sh ${ENVIRONMENT} cleartrac ${TAG}
+
+.deploy_api: &build_api
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - populate_env_file "${TAG}" "${ENVIRONMENT}"
+    - ./deploy_scripts/build/build_jar.sh
+    - FORCE_REBUILD=false PUBLISH_IMAGE=true ./deploy_scripts/build/build_and_publish_container.sh api ${ENVIRONMENT} ${TAG}
+
+.deploy_lambdas: &deploy_lambdas
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_lambdas.sh ${ENVIRONMENT} cleartrac ${TAG}
+
+.deploy_step_functions: &deploy_step_functions
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_step_functions.sh ${ENVIRONMENT} cleartrac ${TAG}
+
+.deploy_quicksight_resources: &deploy_quicksight_resources
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_quicksight_resources.sh ${ENVIRONMENT} cleartrac ${TAG}
+
+.deploy_glue_jobs: &deploy_glue_jobs
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_glue_jobs.sh cleartrac ${TAG}
+
+.update_containers: &update_containers
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - ./deploy_scripts/deploy/deploy_containers.sh ${ENVIRONMENT} ${TAG}
+
+# deploy app-infrostructure
+deploy app-infra nonprod:
+  <<: *nonprod_job
+  <<: *deploy_infrastructure
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    url:
+#    on_stop: tear down dev env
+
+deploy app-infra demo:
+  <<: *demo_job
+  <<: *deploy_infrastructure
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    url:
+
+deploy data-lake infra nonprod:
+  <<: *nonprod_job
+  <<: *deploy_data_lake_infrastructure
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    url:
+
+deploy data-lake infra demo:
+  <<: *demo_job
+  <<: *deploy_data_lake_infrastructure
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    url:
+
+deploy athena views nonprod:
+  <<: *nonprod_job
+  <<: *deploy_athena_views
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+
+deploy app-infra prod:
+  stage: app-infra-deploy-prod
+  <<: *prod_job
+  <<: *deploy_infrastructure
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    url:
+#    on_stop: tear down dev env
+
+deploy data-lake infra prod:
+  <<: *prod_job
+  <<: *deploy_data_lake_infrastructure
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    url:
+
+deploy athena views prod:
+  <<: *prod_job
+  <<: *deploy_athena_views
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+
+#deploy api
+build all containers nonprod:
+  <<: *nonprod_job
+  <<: *build_api
+
+build all containers demo:
+  <<: *demo_job
+  <<: *build_api
+
+build all containers prod:
+  stage: build-publish-containers-prod
+  <<: *prod_job
+  <<: *build_api
+
+build lambdas nonprod:
+  <<: *nonprod_job
+  <<: *deploy_lambdas
+
+build lambdas demo:
+  <<: *demo_job
+  <<: *deploy_lambdas
+
+deploy step functions nonprod:
+  <<: *nonprod_job
+  <<: *deploy_step_functions
+
+deploy step functions demo:
+  <<: *demo_job
+  <<: *deploy_step_functions
+
+deploy quicksight resources nonprod:
+  <<: *nonprod_job
+  <<: *deploy_quicksight_resources
+
+deploy glue jobs nonprod:
+  <<: *nonprod_job
+  <<: *deploy_glue_jobs
+
+build lambdas prod:
+  <<: *prod_job
+  <<: *deploy_lambdas
+
+deploy step functions prod:
+  <<: *prod_job
+  <<: *deploy_step_functions
+
+deploy quicksight resources prod:
+  <<: *prod_job
+  <<: *deploy_quicksight_resources
+
+deploy glue jobs prod:
+  <<: *prod_job
+  <<: *deploy_glue_jobs
+
+force update all containers nonprod:
+  stage: force-update-containers-nonprod
+  <<: *nonprod_job
+  <<: *update_containers
+
+force update all containers demo:
+  stage: force-update-containers-nonprod
+  <<: *demo_job
+  <<: *update_containers
+
+force update all containers prod:
+  stage: force-update-containers-prod
+  <<: *prod_job
+  <<: *update_containers
+
+update database nonprod:
+  stage: database-update-nonprod
+  <<: *nonprod_job
+  <<: *update_database
+
+update database demo:
+  stage: database-update-nonprod
+  <<: *demo_job
+  <<: *update_database
+
+update database prod:
+  stage: database-update-prod
+  <<: *prod_job
+  <<: *update_database
+
+create jira release:
+  stage: create-jira-release
+  <<: *prod_job
+  <<: *create_jira_release
+
+deployment summary:
+  stage: deployment-summary
+  <<: *prod_job
+  <<: *deployment_summary
+
+#testing
+#Int. Tests (API):
+#  <<: *integration_test_job
+#  script:
+#    - cd api
+#    - ./gradlew clean integrationTest
+#  coverage: /\s+-\s{1}Line Coverage:\s(\d+(?:\.\d+)?)%/
+#  artifacts:
+#    paths:
+#      - api/build/reports/coverage.xml
+#      - api/build/reports/html
+
+Unit Tests (Lambdas - NodeJS):
+  <<: *unit_test_job
+  script:
+    - cd lambdas
+    - npm install cross-env
+    - npm run test
+  coverage: /Lines.*?(\d+(?:\.\d+)?)%/
+  artifacts:
+    reports:
+      junit:
+        - lambdas/junit.xml
+    paths:
+      - lambdas/coverage
+
+Unit Tests (Step Functions - NodeJS):
+  <<: *unit_test_job
+  script:
+    - cd lambdas
+    - npm install
+    - cd ../step-functions
+    - npm install cross-env
+    - npm run test
+  coverage: /Lines.*?(\d+(?:\.\d+)?)%/
+  artifacts:
+    reports:
+      junit:
+        - step-functions/junit.xml
+    paths:
+      - step-functions/coverage
+
+Unit Tests (Hub - Client Portal):
+  <<: *unit_test_job
+  script:
+    - cd hub/client-portal
+    #- npm install cross-env
+    #- npm run test:unit
+  #coverage: /Lines.*?(\d+(?:\.\d+)?)%/
+  #artifacts:
+  #  reports:
+  #    junit:
+  #      - hub/client-portal/junit.xml
+  #  paths:
+  #    - hub/client-portal/coverage
+
+Unit Tests (Hub - API):
+  <<: *unit_test_job
+  script:
+    - cd hub/api
+    - ./gradlew clean test
+  coverage: /\s+-\s{1}Line Coverage:\s(\d+(?:\.\d+)?)%/
+  artifacts:
+    reports:
+      junit:
+        - hub/api/build/test-results/test/TEST-*.xml
+    paths:
+      - hub/api/build/reports/coverage.xml
+      - hub/api/build/reports/html
+
+#Integration Tests (Hub - API):
+#  <<: *integration_test_job
+#  script:
+#    - cd hub/api
+#    - sudo rm -drf .gradle
+#    - ./api_tests/run_unit_tests_with_dependencies.sh
+
+Unit Tests (Risky - Client Portal):
+  <<: *unit_test_job
+  script:
+    - cd risk/client-portal
+#    - npm install cross-env
+#    - npm run test:unit
+#  coverage: /Lines.*?(\d+(?:\.\d+)?)%/
+#  artifacts:
+#    reports:
+#      junit:
+#        - risk/client-portal/junit.xml
+#    paths:
+#      - risk/client-portal/coverage
+
+Unit Tests (Lambda - Python):
+  <<: *unit_test_job
+  script:
+    - cd lambdas
+    - docker build -t python-unit-testing-image .
+    - docker rm -f pythontestingcontainer || true
+    - docker run --name pythontestingcontainer -t python-unit-testing-image pytest
+    - if [[ "$(docker logs pythontestingcontainer >& container-logs ; cat container-logs | grep -E '(FAILED)' | wc -l)" -gt 0 ]] || [[ "$(docker container wait pythontestingcontainer)" -eq 1 ]]; then echo -e "\e[31mUnit Tests Failed.\e[0m"; exit 1; fi
+
+Cypress UI Tests (Hub - Client Portal):
+  extends: .cypress e2e regression
+  <<: *cypress_test_job
+  before_script:
+    - source $PWD/deploy_scripts/development_tools.sh
+    - TAG=$(tag_to_build "${CI_COMMIT_REF_SLUG}")
+    - CYPRESS_BASEURL=https://client-${TAG}-hub.thecleartrac.construction
+  variables:
+    CYPRESS_PROJECT_PATH: "./hub/client-portal"
+    CYPRESS_TESTS_ROOT_RELATIVE_PATH: "cypress"
+  artifacts:
+    paths:
+      - hub/client-portal/cypress/cypress/screenshots
+      - hub/client-portal/cypress/cypress/videos
+    when: on_failure
+
+#security
+container-scanning:
+  stage: security-scanning
+  when: manual
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  image: docker:stable
+  variables:
+    DOCKER_DRIVER: overlay2
+    CI_APPLICATION_TAG: latest
+  allow_failure: true
+  services:
+    - docker:stable-dind
+  script:
+    - chmod +x deploy_scripts/security/security_scanning_container.sh
+    - deploy_scripts/security/security_scanning_container.sh ${ENVIRONMENT}
+  artifacts:
+    paths: [gl-container-scanning-report-LANDING.json,gl-container-scanning-report-API.json,gl-container-scanning-report-CLIENT.json]
+  only:
+    - tags
+
+sast:
+  stage: security-scanning
+  tags:
+    - riskybusiness-nonprod-runner-node18
+
+client-dast:
+  stage: security-scanning
+  when: manual
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  only:
+    - tags
+
+#teardown
+tear-down-env:
+  stage: tear-down-env
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - deploy_scripts/tear-down/tear_down_dev_environment.sh ${TAG}
+  when: manual
+  only:
+    - tags
+  except:
+    - /^almost-prod-[0-9]+-[0-9]{8}$/
+    - /^prod-[0-9]+-[0-9]{8}$/
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    action: stop
+
+#teardown stack using gitlab ci/cd variables
+#variable resets after each use
+tear-down-stack:
+  stage: tear-down-stack
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    - deploy_scripts/tear-down/tear_down_stack.sh ${stack_to_delete}
+  when: manual
+#  only:
+#    - tags
+  except:
+    - /^prod-[0-9]+-[0-9]{8}$/
+    - /^demo-[0-9]+-[0-9]{8}$/
+  environment:
+    name: development/$CI_COMMIT_REF_NAME
+    action: stop
+
+# script definitions
+# FOR USE WHEN risky's db moves to new hub rds
+kill_fill_database:
+  stage: tear-down-env
+  tags:
+    - riskybusiness-nonprod-runner-node18
+  script:
+    - chmod -R +x ./deploy_scripts/*
+    # CT Hub Migrations
+    - ./deploy_scripts/deploy/deploy_database.sh ${TAG} hub_${TAG} "hub/api" kill
+    # Clear Cognito User Pool for Alpha
+    - ./deploy_scripts/deploy/clear_user_pool.sh ${TAG}
+  when: manual
+  only:
+    - tags
+  except:
+    - /^almost-prod-[0-9]+-[0-9]{8}$/
+    - /^prod-[0-9]+-[0-9]{8}$/
+    - /^beta-[0-9]+-[0-9]{8}$/
+    - /^demo-[0-9]+-[0-9]{8}$/
